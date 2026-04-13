@@ -1,0 +1,960 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>업무 비서 시스템</title>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/react/18.2.0/umd/react.production.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/react-dom/18.2.0/umd/react-dom.production.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/babel-standalone/7.23.5/babel.min.js"></script>
+<script src="https://cdn.tailwindcss.com"></script>
+<style>
+  body { font-family: 'Pretendard', 'Apple SD Gothic Neo', sans-serif; }
+  pre { font-family: inherit; }
+  ::-webkit-scrollbar { width: 6px; height: 6px; }
+  ::-webkit-scrollbar-track { background: #f1f1f1; }
+  ::-webkit-scrollbar-thumb { background: #d1d5db; border-radius: 3px; }
+</style>
+</head>
+<body class="bg-gray-50">
+<div id="root"></div>
+<script type="text/babel">
+const { useState, useEffect, useRef, useCallback } = React;
+
+// ── helpers ──────────────────────────────────────────
+const uid = () => Date.now().toString(36) + Math.random().toString(36).slice(2);
+const LS = {
+  get: k => { try { const v = localStorage.getItem(k); return v ? JSON.parse(v) : null; } catch { return null; } },
+  set: (k, v) => { try { localStorage.setItem(k, JSON.stringify(v)); } catch {} },
+};
+
+// Google Apps Script Web App URL (설정에서 저장)
+const getGasUrl = () => LS.get("ws_gasUrl") || "";
+
+async function fetchGmail() {
+  const url = getGasUrl();
+  if (!url) throw new Error("GAS_URL_MISSING");
+  const r = await fetch(url + "?action=list");
+  const d = await r.json();
+  if (d.error) throw new Error(d.error);
+  return d.mails || [];
+}
+
+async function sendGmail(to, subject, body) {
+  const url = getGasUrl();
+  if (!url) throw new Error("GAS_URL_MISSING");
+  const r = await fetch(url, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ action: "send", to, subject, body }),
+  });
+  const d = await r.json();
+  if (d.error) throw new Error(d.error);
+  return d;
+}
+const DEFAULT_PW = "admin1234";
+
+async function callAI(apiKey, prompt, { sys, tools, tokens = 1500 } = {}) {
+  const body = { model: "claude-sonnet-4-20250514", max_tokens: tokens, messages: [{ role: "user", content: prompt }] };
+  if (sys) body.system = sys;
+  if (tools) body.tools = tools;
+  const r = await fetch("https://api.anthropic.com/v1/messages", {
+    method: "POST",
+    headers: { "Content-Type": "application/json", "x-api-key": apiKey, "anthropic-version": "2023-06-01", "anthropic-dangerous-direct-browser-access": "true" },
+    body: JSON.stringify(body),
+  });
+  const d = await r.json();
+  if (d.error) throw new Error(d.error.message);
+  return (d.content || []).filter(b => b.type === "text").map(b => b.text).join("");
+}
+async function callJSON(apiKey, prompt, opts = {}) {
+  const t = await callAI(apiKey, prompt, { ...opts, sys: "Return only valid JSON, no markdown, no extra text." });
+  const m = t.replace(/```[\w]*\n?|```/g, "").trim().match(/\{[\s\S]*\}/);
+  return JSON.parse(m?.[0] || "{}");
+}
+
+// ── primitives ───────────────────────────────────────
+const PC = { high: "bg-red-100 text-red-700", medium: "bg-yellow-100 text-yellow-700", low: "bg-green-100 text-green-700" };
+const PL = { high: "높음", medium: "보통", low: "낮음" };
+const SC = { 계획: "bg-purple-100 text-purple-700", 진행중: "bg-blue-100 text-blue-700", 완료: "bg-green-100 text-green-700", 보류: "bg-gray-100 text-gray-600" };
+
+const Badge = ({ c, label }) => <span className={`text-xs px-2 py-0.5 rounded-full font-medium ${c}`}>{label}</span>;
+const Btn = ({ onClick, disabled, cls = "", children }) => (
+  <button onClick={onClick} disabled={disabled} className={`px-3 py-1.5 rounded-lg text-sm font-medium transition disabled:opacity-40 ${cls}`}>{children}</button>
+);
+const Input = ({ value, onChange, placeholder, cls = "", type = "text", onKeyDown }) => (
+  <input type={type} value={value} onChange={e => onChange(e.target.value)} placeholder={placeholder} onKeyDown={onKeyDown}
+    className={`border border-gray-200 rounded-lg px-3 py-1.5 text-sm focus:outline-none focus:ring-2 focus:ring-indigo-300 ${cls}`} />
+);
+const Modal = ({ title, onClose, children, wide }) => (
+  <div className="fixed inset-0 bg-black bg-opacity-40 flex items-center justify-center z-50 p-4">
+    <div className={`bg-white rounded-2xl shadow-2xl w-full ${wide ? "max-w-2xl" : "max-w-lg"} max-h-[90vh] flex flex-col`}>
+      <div className="border-b px-5 py-4 flex justify-between items-center flex-shrink-0">
+        <span className="font-bold text-gray-800">{title}</span>
+        <button onClick={onClose} className="text-gray-400 hover:text-gray-700 text-lg">✕</button>
+      </div>
+      <div className="p-5 overflow-y-auto">{children}</div>
+    </div>
+  </div>
+);
+
+// ══════════════════════════════════════════════════════
+// LOGIN
+// ══════════════════════════════════════════════════════
+function LoginPage({ onLogin }) {
+  const [pw, setPw] = useState("");
+  const [err, setErr] = useState("");
+  const submit = () => {
+    const saved = LS.get("ws_pw") || DEFAULT_PW;
+    if (pw === saved) { LS.set("ws_auth", true); onLogin(); }
+    else { setErr("비밀번호가 올바르지 않습니다."); setPw(""); }
+  };
+  return (
+    <div className="min-h-screen flex items-center justify-center bg-gradient-to-br from-indigo-50 to-purple-50">
+      <div className="bg-white rounded-2xl shadow-xl p-8 w-full max-w-sm">
+        <div className="text-center mb-8">
+          <div className="text-4xl mb-3">🗂️</div>
+          <h1 className="text-xl font-bold text-gray-800">업무 비서 시스템</h1>
+          <p className="text-sm text-gray-400 mt-1">비밀번호를 입력하세요</p>
+        </div>
+        <Input type="password" value={pw} onChange={setPw} placeholder="비밀번호"
+          cls="w-full mb-3" onKeyDown={e => e.key === "Enter" && submit()} />
+        {err && <p className="text-xs text-red-500 mb-3">{err}</p>}
+        <Btn onClick={submit} cls="w-full bg-indigo-500 text-white hover:bg-indigo-600">로그인</Btn>
+        <p className="text-xs text-gray-400 text-center mt-4">초기 비밀번호: admin1234</p>
+      </div>
+    </div>
+  );
+}
+
+// ══════════════════════════════════════════════════════
+// SETTINGS
+// ══════════════════════════════════════════════════════
+function SettingsModule({ apiKey, setApiKey, onLogout }) {
+  const [key, setKey] = useState(apiKey);
+  const [gasUrl, setGasUrl] = useState(() => LS.get("ws_gasUrl") || "");
+  const [pw, setPw] = useState(""); const [pw2, setPw2] = useState("");
+  const [msg, setMsg] = useState(""); const [gasMsg, setGasMsg] = useState(""); const [pwMsg, setPwMsg] = useState("");
+  const saveKey = () => { LS.set("ws_apikey", key); setApiKey(key); setMsg("✅ API 키가 저장됐어요."); setTimeout(() => setMsg(""), 3000); };
+  const saveGas = () => { LS.set("ws_gasUrl", gasUrl); setGasMsg("✅ GAS URL이 저장됐어요."); setTimeout(() => setGasMsg(""), 3000); };
+  const changePw = () => {
+    if (!pw || pw !== pw2) { setPwMsg("비밀번호가 일치하지 않거나 비어 있어요."); return; }
+    LS.set("ws_pw", pw); setPw(""); setPw2(""); setPwMsg("✅ 비밀번호가 변경됐어요."); setTimeout(() => setPwMsg(""), 3000);
+  };
+  return (
+    <div className="max-w-lg space-y-6">
+      <div className="bg-white rounded-xl border p-5">
+        <h3 className="font-semibold text-gray-800 mb-1">🔑 Anthropic API 키</h3>
+        <p className="text-xs text-gray-400 mb-3">AI 기능(보고서 작성, 뉴스 분석, 메일 회신 등)에 사용됩니다.<br />
+          키는 브라우저 localStorage에만 저장되며 외부로 전송되지 않습니다.</p>
+        <div className="flex gap-2">
+          <Input type="password" value={key} onChange={setKey} placeholder="sk-ant-..." cls="flex-1" />
+          <Btn onClick={saveKey} cls="bg-indigo-500 text-white hover:bg-indigo-600">저장</Btn>
+        </div>
+        {msg && <p className="text-xs text-green-600 mt-2">{msg}</p>}
+        <a href="https://console.anthropic.com/account/keys" target="_blank" rel="noreferrer"
+          className="text-xs text-indigo-500 hover:underline mt-2 block">→ Anthropic Console에서 API 키 발급</a>
+      </div>
+      <div className="bg-white rounded-xl border p-5">
+        <h3 className="font-semibold text-gray-800 mb-1">📬 Gmail 연동 (Google Apps Script)</h3>
+        <p className="text-xs text-gray-400 mb-3">Gmail 자동 동기화 및 메일 발송에 사용됩니다.<br />
+          Google Apps Script 배포 후 생성된 웹 앱 URL을 입력하세요.</p>
+        <div className="flex gap-2">
+          <Input value={gasUrl} onChange={setGasUrl} placeholder="https://script.google.com/macros/s/xxxxx/exec" cls="flex-1" />
+          <Btn onClick={saveGas} cls="bg-red-500 text-white hover:bg-red-600">저장</Btn>
+        </div>
+        {gasMsg && <p className="text-xs text-green-600 mt-2">{gasMsg}</p>}
+        {gasUrl && <p className="text-xs text-green-600 mt-1">✅ Gmail 연동 활성화됨</p>}
+        <a href="https://script.google.com" target="_blank" rel="noreferrer"
+          className="text-xs text-indigo-500 hover:underline mt-2 block">→ Google Apps Script 바로가기</a>
+      </div>
+      <div className="bg-white rounded-xl border p-5">
+        <h3 className="font-semibold text-gray-800 mb-3">🔒 비밀번호 변경</h3>
+        <div className="space-y-2">
+          <Input type="password" value={pw} onChange={setPw} placeholder="새 비밀번호" cls="w-full" />
+          <Input type="password" value={pw2} onChange={setPw2} placeholder="새 비밀번호 확인" cls="w-full" />
+          <Btn onClick={changePw} cls="bg-gray-700 text-white hover:bg-gray-800">변경</Btn>
+        </div>
+        {pwMsg && <p className="text-xs text-green-600 mt-2">{pwMsg}</p>}
+      </div>
+      <div className="bg-white rounded-xl border p-5">
+        <h3 className="font-semibold text-gray-800 mb-3">⚠️ 데이터 관리</h3>
+        <Btn onClick={() => { if(confirm("모든 데이터를 초기화하시겠어요?")) { ["ws_tasks","ws_mails","ws_reports","ws_partners","ws_projects","ws_watchList","ws_news"].forEach(k => localStorage.removeItem(k)); alert("초기화 완료"); } }}
+          cls="bg-red-50 text-red-600 border border-red-200 hover:bg-red-100">전체 데이터 초기화</Btn>
+      </div>
+      <Btn onClick={onLogout} cls="bg-gray-100 text-gray-700 hover:bg-gray-200 border">로그아웃</Btn>
+    </div>
+  );
+}
+
+// ══════════════════════════════════════════════════════
+// 1. 업무 리스트
+// ══════════════════════════════════════════════════════
+function TasksModule() {
+  const [tasks, setTasks] = useState(() => LS.get("ws_tasks") || []);
+  const [view, setView] = useState("weekly");
+  const [selDate, setSelDate] = useState(new Date().toISOString().slice(0,10));
+  const [form, setForm] = useState({ title:"", priority:"medium", category:"" });
+  const [showAdd, setShowAdd] = useState(false);
+  useEffect(() => LS.set("ws_tasks", tasks), [tasks]);
+
+  const add = () => {
+    if (!form.title.trim()) return;
+    setTasks(p => [{ id:uid(), ...form, date:selDate, done:false, ts:Date.now() }, ...p]);
+    setForm({ title:"", priority:"medium", category:"" }); setShowAdd(false);
+  };
+  const toggle = id => setTasks(p => p.map(t => t.id===id ? {...t,done:!t.done} : t));
+  const del = id => setTasks(p => p.filter(t => t.id!==id));
+
+  const filtered = tasks.filter(t => {
+    const td=new Date(t.date), sd=new Date(selDate);
+    if (view==="daily") return t.date===selDate;
+    if (view==="weekly") {
+      const mon=new Date(sd); mon.setDate(sd.getDate()-(sd.getDay()||7)+1);
+      const sun=new Date(mon); sun.setDate(mon.getDate()+6);
+      return td>=mon && td<=sun;
+    }
+    return td.getFullYear()===sd.getFullYear()&&td.getMonth()===sd.getMonth();
+  });
+  const grouped = view==="daily" ? {[selDate]:filtered} : filtered.reduce((a,t)=>{(a[t.date]=a[t.date]||[]).push(t);return a;},{});
+  const totals = ["high","medium","low"].map(p=>({p,total:filtered.filter(t=>t.priority===p).length,done:filtered.filter(t=>t.priority===p&&t.done).length}));
+
+  return (
+    <div>
+      {showAdd && <Modal title="업무 추가" onClose={()=>setShowAdd(false)}>
+        <div className="space-y-3">
+          <Input value={form.title} onChange={v=>setForm(p=>({...p,title:v}))} placeholder="업무명" cls="w-full" />
+          <select value={form.priority} onChange={e=>setForm(p=>({...p,priority:e.target.value}))} className="w-full border rounded-lg px-3 py-1.5 text-sm focus:outline-none focus:ring-2 focus:ring-indigo-300">
+            <option value="high">높음</option><option value="medium">보통</option><option value="low">낮음</option>
+          </select>
+          <Input value={form.category} onChange={v=>setForm(p=>({...p,category:v}))} placeholder="카테고리" cls="w-full" />
+          <Input type="date" value={selDate} onChange={v=>setSelDate(v)} placeholder="" cls="w-full" />
+          <Btn onClick={add} cls="w-full bg-indigo-500 text-white hover:bg-indigo-600">추가</Btn>
+        </div>
+      </Modal>}
+      <div className="flex items-center justify-between mb-4 flex-wrap gap-2">
+        <div className="flex gap-1 bg-gray-100 rounded-xl p-1">
+          {[["daily","일"],["weekly","주"],["monthly","월"]].map(([v,l])=>(
+            <button key={v} onClick={()=>setView(v)} className={`px-4 py-1.5 rounded-lg text-sm font-medium transition ${view===v?"bg-white shadow text-indigo-600":"text-gray-500"}`}>{l}간</button>
+          ))}
+        </div>
+        <div className="flex gap-2 items-center">
+          <input type={view==="monthly"?"month":"date"} value={view==="monthly"?selDate.slice(0,7):selDate}
+            onChange={e=>setSelDate(view==="monthly"?e.target.value+"-01":e.target.value)}
+            className="border rounded-lg px-3 py-1.5 text-sm focus:outline-none focus:ring-2 focus:ring-indigo-300" />
+          <Btn onClick={()=>setShowAdd(true)} cls="bg-indigo-500 text-white hover:bg-indigo-600">+ 업무 추가</Btn>
+        </div>
+      </div>
+      <div className="grid grid-cols-3 gap-3 mb-4">
+        {totals.map(({p,total,done})=>(
+          <div key={p} className="bg-white rounded-xl border p-3 text-center">
+            <Badge c={PC[p]} label={PL[p]} />
+            <div className="text-2xl font-bold text-gray-800 mt-1">{done}<span className="text-sm text-gray-400">/{total}</span></div>
+            <div className="text-xs text-gray-400">완료/전체</div>
+          </div>
+        ))}
+      </div>
+      {Object.keys(grouped).sort().map(date=>(
+        <div key={date} className="mb-4">
+          {view!=="daily"&&<div className="text-xs font-semibold text-gray-500 mb-2 px-1">📅 {new Date(date).toLocaleDateString("ko-KR",{month:"long",day:"numeric",weekday:"short"})}</div>}
+          <div className="space-y-2">
+            {(grouped[date]||[]).map(t=>(
+              <div key={t.id} className={`bg-white rounded-xl border p-3 flex items-center gap-3 ${t.done?"opacity-50":""}`}>
+                <button onClick={()=>toggle(t.id)} className={`w-5 h-5 rounded-full border-2 flex-shrink-0 flex items-center justify-center ${t.done?"bg-indigo-500 border-indigo-500":"border-gray-300 hover:border-indigo-400"}`}>
+                  {t.done&&<span className="text-white text-xs">✓</span>}
+                </button>
+                <div className="flex-1 min-w-0">
+                  <span className={`text-sm font-medium ${t.done?"line-through text-gray-400":"text-gray-800"}`}>{t.title}</span>
+                  {t.category&&<span className="ml-2 text-xs text-gray-400">{t.category}</span>}
+                </div>
+                <Badge c={PC[t.priority]} label={PL[t.priority]} />
+                <button onClick={()=>del(t.id)} className="text-gray-300 hover:text-red-400 text-sm">🗑</button>
+              </div>
+            ))}
+          </div>
+        </div>
+      ))}
+      {Object.keys(grouped).length===0&&<div className="text-center py-16 text-gray-400 text-sm">등록된 업무가 없어요</div>}
+    </div>
+  );
+}
+
+// ══════════════════════════════════════════════════════
+// 2. 수신메일 현황
+// ══════════════════════════════════════════════════════
+function MailModule({ apiKey }) {
+  const [mails, setMails] = useState(() => LS.get("ws_mails") || []);
+  const [showAdd, setShowAdd] = useState(false);
+  const [syncing, setSyncing] = useState(false);
+  const [syncMsg, setSyncMsg] = useState("");
+  const [form, setForm] = useState({ company:"", from:"", email:"", receivedAt:"", subject:"", content:"" });
+  const [analyzing, setAnalyzing] = useState(false);
+  const [expanded, setExpanded] = useState(null);
+  const [replyMail, setReplyMail] = useState(null);
+  const [variants, setVariants] = useState(null);
+  const [replyLoading, setReplyLoading] = useState(false);
+  const [sendModal, setSendModal] = useState(null);
+  const [sending, setSending] = useState(false);
+  const [catFilter, setCatFilter] = useState("전체");
+  useEffect(() => LS.set("ws_mails", mails), [mails]);
+
+  // Gmail 자동 동기화
+  const syncGmail = async () => {
+    const gasUrl = getGasUrl();
+    if (!gasUrl) { setSyncMsg("⚠️ 설정에서 Google Apps Script URL을 먼저 입력해주세요."); setTimeout(()=>setSyncMsg(""),4000); return; }
+    setSyncing(true); setSyncMsg("📬 Gmail에서 업무 메일 불러오는 중...");
+    try {
+      const raw = await fetchGmail();
+      if (!apiKey) { setSyncMsg("⚠️ API 키 미설정 — 메일은 불러왔지만 AI 분석 없이 저장됩니다."); }
+      const newMails = await Promise.all(raw.map(async m => {
+        let priority="medium", category="기타", summary=m.snippet.slice(0,80)||"내용 없음";
+        if (apiKey) {
+          try {
+            const d = await callJSON(apiKey,
+              `메일을 분석해줘. 제목: ${m.subject} / 내용: ${m.snippet}
+업무 관련 여부, 우선순위, 카테고리, 2문장 요약 JSON:
+{"isBusiness":true,"priority":"high|medium|low","category":"회의|요청|보고|계약|기타","summary":"요약"}`
+            );
+            if (!d.isBusiness) return null;
+            priority=d.priority||"medium"; category=d.category||"기타"; summary=d.summary||summary;
+          } catch {}
+        }
+        return { id:uid(), company:m.company, from:m.from, email:m.email,
+          receivedAt:m.receivedAt, subject:m.subject, content:m.snippet,
+          priority, category, summary, ts:Date.now() };
+      }));
+      const filtered = newMails.filter(Boolean);
+      const existIds = new Set(mails.map(x=>x.subject+x.from));
+      const fresh = filtered.filter(m => !existIds.has(m.subject+m.from));
+      setMails(p => [...fresh, ...p]);
+      setSyncMsg(`✅ 업무 메일 ${fresh.length}개 추가됨 (중복 ${filtered.length-fresh.length}건 제외)`);
+    } catch(e) {
+      setSyncMsg(e.message==="GAS_URL_MISSING" ? "⚠️ GAS URL을 설정해주세요." : "⚠️ 동기화 실패: " + e.message);
+    }
+    setSyncing(false); setTimeout(()=>setSyncMsg(""),5000);
+  };
+
+  // 메일 발송
+  const doSend = async () => {
+    if (!sendModal) return;
+    setSending(true);
+    try {
+      await sendGmail(sendModal.to, sendModal.subject, sendModal.body);
+      alert("✅ 메일이 발송됐어요!");
+      setSendModal(null);
+    } catch(e) { alert("발송 실패: " + e.message); }
+    setSending(false);
+  };
+
+  const analyze = async () => {
+    if (!apiKey) { alert("설정에서 API 키를 먼저 입력해주세요."); return; }
+    if (!form.subject && !form.content) { alert("제목 또는 내용을 입력해주세요."); return; }
+    setAnalyzing(true);
+    try {
+      const d = await callJSON(apiKey,
+        `메일을 분석해서 업무 관련 여부 판단 및 정보 추출해줘.
+제목: ${form.subject}
+내용: ${form.content}
+{"isBusiness":true/false,"priority":"high|medium|low","category":"회의|요청|보고|계약|기타","summary":"2문장 요약"}`
+      );
+      if (!d.isBusiness) { alert("업무와 관련 없는 메일로 판단됩니다."); setAnalyzing(false); return; }
+      setMails(p => [{ id:uid(), ...form, priority:d.priority, category:d.category, summary:d.summary, ts:Date.now() }, ...p]);
+      setForm({ company:"",from:"",email:"",receivedAt:"",subject:"",content:"" });
+      setShowAdd(false);
+    } catch { alert("AI 분석 실패. API 키를 확인해주세요."); }
+    setAnalyzing(false);
+  };
+
+  const addManual = () => {
+    if (!form.subject.trim()) return;
+    setMails(p => [{ id:uid(), ...form, priority:"medium", category:"기타", summary:form.content.slice(0,80)||"내용 없음", ts:Date.now() }, ...p]);
+    setForm({ company:"",from:"",email:"",receivedAt:"",subject:"",content:"" }); setShowAdd(false);
+  };
+
+  const openReply = async mail => {
+    setReplyMail(mail); setVariants(null); setReplyLoading(true);
+    try {
+      const d = await callJSON(apiKey,
+        `메일 회신 초안 3가지 전략으로 작성해줘.
+제목: ${mail.subject} | 발신자: ${mail.from}(${mail.company}) | 요약: ${mail.summary}
+{"variants":[{"label":"전략명","subject":"제목","body":"본문"}]}`
+      );
+      setVariants(d.variants || []);
+    } catch { setVariants([{ label:"기본 회신", subject:"Re: "+mail.subject, body:"안녕하세요,\n\n검토 후 회신드리겠습니다.\n\n감사합니다." }]); }
+    setReplyLoading(false);
+  };
+
+  const prepSend = (mail, v) => setSendModal({ to: mail.email, subject: v.subject, body: v.body, fromMail: mail });
+
+  const cats = ["전체",...Array.from(new Set(mails.map(m=>m.category).filter(Boolean)))];
+  const shown = catFilter==="전체" ? mails : mails.filter(m=>m.category===catFilter);
+
+  return (
+    <div>
+      {replyMail && <Modal title="✉️ 회신 초안" onClose={()=>{setReplyMail(null);setVariants(null);}} wide>
+        <div className="text-xs text-gray-400 mb-3">{replyMail.subject} · {replyMail.from}</div>
+        {replyLoading ? <div className="text-center py-10 text-indigo-500">⏳ AI 초안 작성 중...</div> : (
+          <div className="space-y-4">
+            {(variants||[]).map((v,i)=>(
+              <div key={i} className="border rounded-xl p-4">
+                <div className="flex justify-between mb-2">
+                  <Badge c="bg-indigo-100 text-indigo-700" label={v.label} />
+                  <button onClick={()=>navigator.clipboard.writeText(`제목: ${v.subject}\n\n${v.body}`)} className="text-xs text-gray-400 hover:text-indigo-600 border rounded px-2 py-1">복사</button>
+                </div>
+                <div className="text-xs text-gray-500 mb-2">제목: {v.subject}</div>
+                <pre className="text-sm text-gray-700 whitespace-pre-wrap bg-gray-50 rounded-lg p-3">{v.body}</pre>
+              </div>
+            ))}
+          </div>
+        )}
+      </Modal>}
+      {showAdd && <Modal title="메일 등록" onClose={()=>setShowAdd(false)} wide>
+        <div className="space-y-3">
+          <div className="grid grid-cols-2 gap-2">
+            <Input value={form.company} onChange={v=>setForm(p=>({...p,company:v}))} placeholder="회사명" cls="w-full" />
+            <Input value={form.from} onChange={v=>setForm(p=>({...p,from:v}))} placeholder="발신자명" cls="w-full" />
+            <Input value={form.email} onChange={v=>setForm(p=>({...p,email:v}))} placeholder="발신자 이메일" cls="w-full" />
+            <Input type="date" value={form.receivedAt} onChange={v=>setForm(p=>({...p,receivedAt:v}))} placeholder="" cls="w-full" />
+          </div>
+          <Input value={form.subject} onChange={v=>setForm(p=>({...p,subject:v}))} placeholder="메일 제목" cls="w-full" />
+          <textarea value={form.content} onChange={e=>setForm(p=>({...p,content:e.target.value}))} rows={5}
+            placeholder="메일 본문 (AI 분석 시 활용됩니다)"
+            className="w-full border rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-indigo-300 resize-none" />
+          <div className="flex gap-2">
+            <Btn onClick={analyze} disabled={analyzing} cls="flex-1 bg-indigo-500 text-white hover:bg-indigo-600">{analyzing?"⏳ AI 분석중...":"✨ AI 분석 후 등록"}</Btn>
+            <Btn onClick={addManual} cls="flex-1 bg-gray-100 text-gray-700 hover:bg-gray-200 border">그냥 등록</Btn>
+          </div>
+        </div>
+      </Modal>}
+      <div className="flex items-center justify-between mb-3 flex-wrap gap-2">
+        <div className="flex gap-1 flex-wrap">
+          {cats.map(c=>(
+            <button key={c} onClick={()=>setCatFilter(c)} className={`px-3 py-1 rounded-full text-xs font-medium transition ${catFilter===c?"bg-indigo-500 text-white":"bg-white border text-gray-600 hover:bg-gray-50"}`}>{c}</button>
+          ))}
+        </div>
+        <Btn onClick={()=>setShowAdd(true)} cls="bg-indigo-500 text-white hover:bg-indigo-600">+ 메일 등록</Btn>
+      </div>
+      <div className="bg-white rounded-xl border overflow-x-auto">
+        <table className="w-full text-sm min-w-[680px]">
+          <thead className="bg-gray-50 border-b">
+            <tr>{["회사명","발신자","수신일","제목","우선순위","카테고리",""].map(h=><th key={h} className="px-3 py-3 text-left text-xs font-semibold text-gray-500 whitespace-nowrap">{h}</th>)}</tr>
+          </thead>
+          <tbody>
+            {shown.length===0&&<tr><td colSpan={7} className="text-center py-14 text-gray-400 text-sm">등록된 메일이 없어요. 메일을 추가해주세요.</td></tr>}
+            {shown.map(m=>[
+              <tr key={m.id} className="border-b hover:bg-gray-50 cursor-pointer" onClick={()=>setExpanded(expanded===m.id?null:m.id)}>
+                <td className="px-3 py-3 font-medium text-gray-800 whitespace-nowrap">{m.company||"-"}</td>
+                <td className="px-3 py-3 text-gray-600 whitespace-nowrap">{m.from}</td>
+                <td className="px-3 py-3 text-gray-400 text-xs whitespace-nowrap">{m.receivedAt?new Date(m.receivedAt).toLocaleDateString("ko-KR"):"-"}</td>
+                <td className="px-3 py-3 text-gray-700 max-w-xs truncate">{m.subject}</td>
+                <td className="px-3 py-3"><Badge c={PC[m.priority]} label={PL[m.priority]} /></td>
+                <td className="px-3 py-3"><Badge c="bg-blue-50 text-blue-600" label={m.category||"-"} /></td>
+                <td className="px-3 py-3 flex gap-1">
+                  <button onClick={e=>{e.stopPropagation();openReply(m);}} className="text-xs bg-indigo-50 text-indigo-600 border border-indigo-200 px-2 py-1 rounded-lg hover:bg-indigo-100 whitespace-nowrap">✉️ 회신</button>
+                  <button onClick={e=>{e.stopPropagation();setMails(p=>p.filter(x=>x.id!==m.id));}} className="text-xs text-gray-300 hover:text-red-400 px-1">🗑</button>
+                </td>
+              </tr>,
+              expanded===m.id&&<tr key={m.id+"-x"} className="bg-blue-50"><td colSpan={7} className="px-6 py-3 text-sm text-gray-700">{m.summary}</td></tr>
+            ])}
+          </tbody>
+        </table>
+      </div>
+    </div>
+  );
+}
+
+// ══════════════════════════════════════════════════════
+// 3. 업무 보고서 DB
+// ══════════════════════════════════════════════════════
+function ReportsModule({ apiKey }) {
+  const [reports, setReports] = useState(() => LS.get("ws_reports") || []);
+  const [showNew, setShowNew] = useState(false);
+  const [form, setForm] = useState({ title:"", type:"보고서", context:"" });
+  const [drafting, setDrafting] = useState(false);
+  const [draft, setDraft] = useState("");
+  const [view, setView] = useState(null);
+  useEffect(() => LS.set("ws_reports", reports), [reports]);
+
+  const generate = async () => {
+    if (!apiKey) { alert("설정에서 API 키를 먼저 입력해주세요."); return; }
+    setDrafting(true);
+    try {
+      const t = await callAI(apiKey,
+        `업무 보고서 작성해줘.\n제목: ${form.title}\n종류: ${form.type}\n내용/배경: ${form.context}\n\n서론·본론(항목별)·결론/건의사항 순서로 정식 보고서 형태로 작성.`,
+        { sys:"You are a Korean business report expert. Write formal, professional Korean reports." }
+      );
+      setDraft(t);
+    } catch { setDraft("보고서 생성 실패. API 키를 확인해주세요."); }
+    setDrafting(false);
+  };
+
+  const save = () => {
+    setReports(p => [{ id:uid(), ...form, content:draft, status:"완료", ts:Date.now() }, ...p]);
+    setShowNew(false); setForm({ title:"", type:"보고서", context:"" }); setDraft("");
+  };
+
+  return (
+    <div>
+      {view&&<Modal title={view.title} onClose={()=>setView(null)} wide>
+        <div className="text-xs text-gray-400 mb-3">{new Date(view.ts).toLocaleDateString("ko-KR")} · {view.type}</div>
+        <pre className="text-sm text-gray-700 whitespace-pre-wrap leading-relaxed">{view.content}</pre>
+        <div className="mt-4"><button onClick={()=>navigator.clipboard.writeText(view.content)} className="text-xs border rounded-lg px-3 py-1.5 hover:bg-gray-50">복사</button></div>
+      </Modal>}
+      {showNew&&<Modal title="새 보고서 작성" onClose={()=>{setShowNew(false);setDraft("");}} wide>
+        <div className="space-y-3">
+          <Input value={form.title} onChange={v=>setForm(p=>({...p,title:v}))} placeholder="보고서 제목" cls="w-full" />
+          <select value={form.type} onChange={e=>setForm(p=>({...p,type:e.target.value}))} className="w-full border rounded-lg px-3 py-1.5 text-sm focus:outline-none focus:ring-2 focus:ring-indigo-300">
+            {["보고서","기획서","제안서","회의록","결과보고","현황보고"].map(t=><option key={t}>{t}</option>)}
+          </select>
+          <textarea value={form.context} onChange={e=>setForm(p=>({...p,context:e.target.value}))} rows={4} placeholder="주요 내용 / 배경 / 핵심 포인트"
+            className="w-full border rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-indigo-300 resize-none" />
+          <Btn onClick={generate} disabled={drafting} cls="w-full bg-indigo-500 text-white hover:bg-indigo-600">{drafting?"✨ AI 작성 중...":"✨ AI 보고서 작성"}</Btn>
+          {draft&&<>
+            <div className="border rounded-xl p-3 bg-gray-50 max-h-64 overflow-y-auto"><pre className="text-xs text-gray-700 whitespace-pre-wrap leading-relaxed">{draft}</pre></div>
+            <Btn onClick={save} cls="w-full bg-green-500 text-white hover:bg-green-600">💾 보고서 저장</Btn>
+          </>}
+        </div>
+      </Modal>}
+      <div className="flex justify-between items-center mb-4">
+        <div className="text-sm text-gray-500">총 {reports.length}건</div>
+        <Btn onClick={()=>setShowNew(true)} cls="bg-indigo-500 text-white hover:bg-indigo-600">+ 보고서 작성</Btn>
+      </div>
+      <div className="bg-white rounded-xl border overflow-hidden">
+        <table className="w-full text-sm">
+          <thead className="bg-gray-50 border-b"><tr>{["제목","종류","작성일","상태",""].map(h=><th key={h} className="px-4 py-3 text-left text-xs font-semibold text-gray-500">{h}</th>)}</tr></thead>
+          <tbody>
+            {reports.length===0&&<tr><td colSpan={5} className="text-center py-14 text-gray-400 text-sm">작성된 보고서가 없어요</td></tr>}
+            {reports.map(r=>(
+              <tr key={r.id} className="border-b hover:bg-gray-50">
+                <td className="px-4 py-3 font-medium text-indigo-600 cursor-pointer hover:underline" onClick={()=>setView(r)}>{r.title}</td>
+                <td className="px-4 py-3"><Badge c="bg-purple-100 text-purple-700" label={r.type} /></td>
+                <td className="px-4 py-3 text-gray-500 text-xs">{new Date(r.ts).toLocaleDateString("ko-KR")}</td>
+                <td className="px-4 py-3"><Badge c="bg-green-100 text-green-700" label={r.status} /></td>
+                <td className="px-4 py-3"><button onClick={()=>setReports(p=>p.filter(x=>x.id!==r.id))} className="text-gray-300 hover:text-red-400">🗑</button></td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </div>
+    </div>
+  );
+}
+
+// ══════════════════════════════════════════════════════
+// 4. 제휴기업 관리 DB
+// ══════════════════════════════════════════════════════
+function PartnersModule() {
+  const [partners, setPartners] = useState(() => LS.get("ws_partners") || []);
+  const [expanded, setExpanded] = useState(null);
+  const [showAdd, setShowAdd] = useState(false);
+  const [form, setForm] = useState({ company:"", bizNo:"", revenue:"", feature:"" });
+  const [cForm, setCForm] = useState({ name:"", position:"", phone:"", email:"" });
+  const [memo, setMemo] = useState("");
+  const [addCo, setAddCo] = useState(null);
+  const [addMemo, setAddMemo] = useState(null);
+  const [search, setSearch] = useState("");
+  useEffect(() => LS.set("ws_partners", partners), [partners]);
+
+  const addPartner = () => {
+    if (!form.company.trim()) return;
+    setPartners(p => [{ id:uid(), ...form, contacts:[], history:[], ts:Date.now() }, ...p]);
+    setForm({ company:"", bizNo:"", revenue:"", feature:"" }); setShowAdd(false);
+  };
+  const addContact = pid => {
+    setPartners(p => p.map(x => x.id===pid?{...x,contacts:[...x.contacts,{id:uid(),...cForm}]}:x));
+    setCForm({ name:"", position:"", phone:"", email:"" }); setAddCo(null);
+  };
+  const saveMemo = pid => {
+    if (!memo.trim()) return;
+    setPartners(p => p.map(x => x.id===pid?{...x,history:[...x.history,{id:uid(),date:new Date().toISOString(),memo}]}:x));
+    setMemo(""); setAddMemo(null);
+  };
+  const shown = partners.filter(p => p.company.includes(search));
+
+  return (
+    <div>
+      {showAdd&&<Modal title="제휴기업 추가" onClose={()=>setShowAdd(false)}>
+        <div className="space-y-3">
+          {[["company","회사명"],["bizNo","사업자번호"],["revenue","매출액"],["feature","업체 특징"]].map(([k,ph])=>(
+            <Input key={k} value={form[k]} onChange={v=>setForm(p=>({...p,[k]:v}))} placeholder={ph} cls="w-full" />
+          ))}
+          <Btn onClick={addPartner} cls="w-full bg-indigo-500 text-white hover:bg-indigo-600">추가</Btn>
+        </div>
+      </Modal>}
+      <div className="flex items-center justify-between mb-4 gap-2">
+        <Input value={search} onChange={setSearch} placeholder="기업명 검색" cls="w-56" />
+        <Btn onClick={()=>setShowAdd(true)} cls="bg-indigo-500 text-white hover:bg-indigo-600">+ 제휴기업 추가</Btn>
+      </div>
+      <div className="space-y-3">
+        {shown.length===0&&<div className="text-center py-16 text-gray-400 text-sm">{search?"검색 결과 없음":"등록된 제휴기업이 없어요"}</div>}
+        {shown.map(p=>(
+          <div key={p.id} className="bg-white rounded-xl border overflow-hidden">
+            <div className="p-4 flex items-center justify-between cursor-pointer" onClick={()=>setExpanded(expanded===p.id?null:p.id)}>
+              <div>
+                <div className="font-semibold text-gray-800">{p.company}</div>
+                <div className="text-xs text-gray-500 mt-0.5 flex gap-3">
+                  {p.bizNo&&<span>사업자: {p.bizNo}</span>}
+                  {p.revenue&&<span>매출: {p.revenue}</span>}
+                </div>
+              </div>
+              <div className="flex items-center gap-2">
+                <Badge c="bg-teal-100 text-teal-700" label={`담당자 ${p.contacts.length}명`} />
+                <span className="text-gray-400 text-sm">{expanded===p.id?"▲":"▼"}</span>
+              </div>
+            </div>
+            {expanded===p.id&&(
+              <div className="border-t bg-gray-50 p-4 space-y-5">
+                {p.feature&&<div className="text-sm text-gray-600 bg-white rounded-lg p-3 border">📌 {p.feature}</div>}
+                <div>
+                  <div className="flex justify-between items-center mb-2">
+                    <span className="text-xs font-semibold text-gray-600">👤 담당자</span>
+                    <button onClick={()=>setAddCo(addCo===p.id?null:p.id)} className="text-xs text-indigo-500 hover:underline">+ 추가</button>
+                  </div>
+                  {addCo===p.id&&(
+                    <div className="grid grid-cols-2 gap-2 mb-3 bg-white p-3 rounded-xl border">
+                      {[["name","이름"],["position","직급"],["phone","연락처"],["email","이메일"]].map(([k,ph])=>(
+                        <Input key={k} value={cForm[k]} onChange={v=>setCForm(x=>({...x,[k]:v}))} placeholder={ph} cls="w-full" />
+                      ))}
+                      <Btn onClick={()=>addContact(p.id)} cls="bg-indigo-500 text-white col-span-2">저장</Btn>
+                    </div>
+                  )}
+                  {p.contacts.length===0&&<div className="text-xs text-gray-400 py-2">등록된 담당자 없음</div>}
+                  {p.contacts.map(c=>(
+                    <div key={c.id} className="flex items-center gap-3 bg-white rounded-lg p-2.5 border mb-1.5 text-sm flex-wrap">
+                      <span className="font-medium text-gray-800">{c.name}</span>
+                      <Badge c="bg-gray-100 text-gray-600" label={c.position} />
+                      {c.phone&&<span className="text-gray-500 text-xs">📞 {c.phone}</span>}
+                      {c.email&&<span className="text-gray-400 text-xs">✉️ {c.email}</span>}
+                    </div>
+                  ))}
+                </div>
+                <div>
+                  <div className="flex justify-between items-center mb-2">
+                    <span className="text-xs font-semibold text-gray-600">📝 제휴 히스토리</span>
+                    <button onClick={()=>setAddMemo(addMemo===p.id?null:p.id)} className="text-xs text-indigo-500 hover:underline">+ 메모</button>
+                  </div>
+                  {addMemo===p.id&&(
+                    <div className="mb-3 space-y-2">
+                      <textarea value={memo} onChange={e=>setMemo(e.target.value)} rows={2} placeholder="히스토리 메모"
+                        className="w-full border rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-indigo-300 resize-none" />
+                      <Btn onClick={()=>saveMemo(p.id)} cls="bg-indigo-500 text-white">저장</Btn>
+                    </div>
+                  )}
+                  {p.history.length===0&&<div className="text-xs text-gray-400 py-2">기록된 히스토리 없음</div>}
+                  {[...p.history].reverse().map(h=>(
+                    <div key={h.id} className="bg-white rounded-lg p-2.5 border mb-1.5">
+                      <div className="text-xs text-gray-400 mb-1">{new Date(h.date).toLocaleDateString("ko-KR")}</div>
+                      <div className="text-sm text-gray-700">{h.memo}</div>
+                    </div>
+                  ))}
+                </div>
+                <button onClick={()=>setPartners(prev=>prev.filter(x=>x.id!==p.id))} className="text-xs text-red-400 hover:underline">기업 삭제</button>
+              </div>
+            )}
+          </div>
+        ))}
+      </div>
+    </div>
+  );
+}
+
+// ══════════════════════════════════════════════════════
+// 5. 프로젝트 수행 DB
+// ══════════════════════════════════════════════════════
+function ProjectsModule() {
+  const [projects, setProjects] = useState(() => LS.get("ws_projects") || []);
+  const [expanded, setExpanded] = useState(null);
+  const [showAdd, setShowAdd] = useState(false);
+  const [form, setForm] = useState({ name:"", client:"", startDate:"", endDate:"", status:"계획" });
+  const [stageIn, setStageIn] = useState({});
+  const [noteIn, setNoteIn] = useState({});
+  useEffect(() => LS.set("ws_projects", projects), [projects]);
+
+  const add = () => {
+    if (!form.name.trim()) return;
+    setProjects(p => [{ id:uid(), ...form, stages:[], notes:[], ts:Date.now() }, ...p]);
+    setForm({ name:"", client:"", startDate:"", endDate:"", status:"계획" }); setShowAdd(false);
+  };
+  const addStage = pid => {
+    const n=stageIn[pid]; if (!n?.trim()) return;
+    setProjects(p=>p.map(x=>x.id===pid?{...x,stages:[...x.stages,{id:uid(),name:n,done:false}]}:x));
+    setStageIn(s=>({...s,[pid]:""}));
+  };
+  const toggleStage = (pid,sid) => setProjects(p=>p.map(x=>x.id===pid?{...x,stages:x.stages.map(s=>s.id===sid?{...s,done:!s.done}:s)}:x));
+  const addNote = pid => {
+    const c=noteIn[pid]; if (!c?.trim()) return;
+    setProjects(p=>p.map(x=>x.id===pid?{...x,notes:[...x.notes,{id:uid(),date:new Date().toISOString(),content:c}]}:x));
+    setNoteIn(n=>({...n,[pid]:""}));
+  };
+  const setStatus = (pid,st) => setProjects(p=>p.map(x=>x.id===pid?{...x,status:st}:x));
+
+  return (
+    <div>
+      {showAdd&&<Modal title="프로젝트 추가" onClose={()=>setShowAdd(false)}>
+        <div className="space-y-3">
+          <Input value={form.name} onChange={v=>setForm(p=>({...p,name:v}))} placeholder="프로젝트명" cls="w-full" />
+          <Input value={form.client} onChange={v=>setForm(p=>({...p,client:v}))} placeholder="발주처/고객사" cls="w-full" />
+          <div className="grid grid-cols-2 gap-2">
+            <Input type="date" value={form.startDate} onChange={v=>setForm(p=>({...p,startDate:v}))} placeholder="" cls="w-full" />
+            <Input type="date" value={form.endDate} onChange={v=>setForm(p=>({...p,endDate:v}))} placeholder="" cls="w-full" />
+          </div>
+          <select value={form.status} onChange={e=>setForm(p=>({...p,status:e.target.value}))} className="w-full border rounded-lg px-3 py-1.5 text-sm focus:outline-none focus:ring-2 focus:ring-indigo-300">
+            {["계획","진행중","완료","보류"].map(s=><option key={s}>{s}</option>)}
+          </select>
+          <Btn onClick={add} cls="w-full bg-indigo-500 text-white hover:bg-indigo-600">추가</Btn>
+        </div>
+      </Modal>}
+      <div className="flex justify-between items-center mb-4">
+        <div className="flex gap-2 flex-wrap">
+          {["전체","계획","진행중","완료","보류"].map(s=>{
+            const cnt=s==="전체"?projects.length:projects.filter(p=>p.status===s).length;
+            return <span key={s} className="text-xs text-gray-500 bg-white border rounded-full px-2.5 py-1">{s} {cnt}</span>;
+          })}
+        </div>
+        <Btn onClick={()=>setShowAdd(true)} cls="bg-indigo-500 text-white hover:bg-indigo-600">+ 프로젝트 추가</Btn>
+      </div>
+      <div className="space-y-3">
+        {projects.length===0&&<div className="text-center py-16 text-gray-400 text-sm">등록된 프로젝트가 없어요</div>}
+        {projects.map(p=>{
+          const doneSt=p.stages.filter(s=>s.done).length;
+          const pct=p.stages.length?Math.round(doneSt/p.stages.length*100):0;
+          return (
+            <div key={p.id} className="bg-white rounded-xl border overflow-hidden">
+              <div className="p-4 cursor-pointer" onClick={()=>setExpanded(expanded===p.id?null:p.id)}>
+                <div className="flex items-start justify-between gap-2">
+                  <div className="flex-1 min-w-0">
+                    <div className="font-semibold text-gray-800">{p.name}</div>
+                    <div className="text-xs text-gray-500 mt-0.5">{p.client}{p.startDate&&` · ${p.startDate}`}{p.endDate&&` ~ ${p.endDate}`}</div>
+                  </div>
+                  <div className="flex items-center gap-2 flex-shrink-0">
+                    <Badge c={SC[p.status]} label={p.status} />
+                    <span className="text-gray-400 text-sm">{expanded===p.id?"▲":"▼"}</span>
+                  </div>
+                </div>
+                {p.stages.length>0&&(
+                  <div className="mt-3">
+                    <div className="flex justify-between text-xs text-gray-400 mb-1"><span>단계 {doneSt}/{p.stages.length}</span><span>{pct}%</span></div>
+                    <div className="h-1.5 bg-gray-100 rounded-full overflow-hidden"><div className="h-full bg-indigo-400 rounded-full transition-all" style={{width:pct+"%"}} /></div>
+                  </div>
+                )}
+              </div>
+              {expanded===p.id&&(
+                <div className="border-t bg-gray-50 p-4 space-y-5">
+                  <div className="flex gap-1.5 flex-wrap">
+                    {["계획","진행중","완료","보류"].map(s=>(
+                      <button key={s} onClick={()=>setStatus(p.id,s)}
+                        className={`px-3 py-1 rounded-full text-xs font-medium border transition ${p.status===s?SC[s]+" border-transparent":"bg-white text-gray-500 border-gray-200"}`}>{s}</button>
+                    ))}
+                  </div>
+                  <div>
+                    <div className="text-xs font-semibold text-gray-600 mb-2">🔖 수행 단계</div>
+                    <div className="space-y-1.5 mb-2">
+                      {p.stages.map(s=>(
+                        <div key={s.id} className="flex items-center gap-2.5 bg-white rounded-lg p-2.5 border">
+                          <button onClick={()=>toggleStage(p.id,s.id)} className={`w-4 h-4 rounded border-2 flex-shrink-0 flex items-center justify-center ${s.done?"bg-indigo-500 border-indigo-500":"border-gray-300"}`}>
+                            {s.done&&<span className="text-white" style={{fontSize:"9px"}}>✓</span>}
+                          </button>
+                          <span className={`text-sm ${s.done?"line-through text-gray-400":"text-gray-700"}`}>{s.name}</span>
+                        </div>
+                      ))}
+                    </div>
+                    <div className="flex gap-2">
+                      <Input value={stageIn[p.id]||""} onChange={v=>setStageIn(s=>({...s,[p.id]:v}))} placeholder="단계명" cls="flex-1"
+                        onKeyDown={e=>e.key==="Enter"&&addStage(p.id)} />
+                      <Btn onClick={()=>addStage(p.id)} cls="bg-indigo-500 text-white">추가</Btn>
+                    </div>
+                  </div>
+                  <div>
+                    <div className="text-xs font-semibold text-gray-600 mb-2">⚠️ 특이사항</div>
+                    {[...p.notes].reverse().map(n=>(
+                      <div key={n.id} className="bg-white rounded-lg p-2.5 border mb-1.5">
+                        <div className="text-xs text-gray-400 mb-1">{new Date(n.date).toLocaleDateString("ko-KR")}</div>
+                        <div className="text-sm text-gray-700">{n.content}</div>
+                      </div>
+                    ))}
+                    <div className="flex gap-2 mt-1">
+                      <Input value={noteIn[p.id]||""} onChange={v=>setNoteIn(n=>({...n,[p.id]:v}))} placeholder="특이사항 기록" cls="flex-1"
+                        onKeyDown={e=>e.key==="Enter"&&addNote(p.id)} />
+                      <Btn onClick={()=>addNote(p.id)} cls="bg-indigo-500 text-white">추가</Btn>
+                    </div>
+                  </div>
+                  <button onClick={()=>setProjects(prev=>prev.filter(x=>x.id!==p.id))} className="text-xs text-red-400 hover:underline">삭제</button>
+                </div>
+              )}
+            </div>
+          );
+        })}
+      </div>
+    </div>
+  );
+}
+
+// ══════════════════════════════════════════════════════
+// 6. 뉴스 모니터링
+// ══════════════════════════════════════════════════════
+function NewsModule({ apiKey }) {
+  const [watchList, setWatchList] = useState(() => LS.get("ws_watchList") || []);
+  const [newsItems, setNewsItems] = useState(() => LS.get("ws_news") || []);
+  const [coInput, setCoInput] = useState("");
+  const [loadingCo, setLoadingCo] = useState(null);
+  const [filter, setFilter] = useState("all");
+  useEffect(() => LS.set("ws_watchList", watchList), [watchList]);
+  useEffect(() => LS.set("ws_news", newsItems), [newsItems]);
+
+  const addCo = () => {
+    if (!coInput.trim() || watchList.includes(coInput.trim())) return;
+    setWatchList(p => [...p, coInput.trim()]); setCoInput("");
+  };
+
+  const fetchNews = async co => {
+    if (!apiKey) { alert("설정에서 API 키를 먼저 입력해주세요."); return; }
+    setLoadingCo(co);
+    try {
+      const text = await callAI(apiKey,
+        `"${co}" 관련 최신 주요 뉴스 6~8개를 웹에서 검색해서 JSON으로만 반환해줘.
+각 뉴스를 Good(긍정) 또는 Bad(부정)로 분류해줘.
+{"news":[{"title":"제목","summary":"한줄요약","sentiment":"good|bad","date":"YYYY-MM-DD"}]}`,
+        { tools:[{ type:"web_search_20250305", name:"web_search" }], tokens:2000, sys:"Return only valid JSON, no markdown." }
+      );
+      const match = text.replace(/```[\w]*\n?|```/g,"").trim().match(/\{[\s\S]*\}/);
+      if (!match) throw new Error();
+      const parsed = JSON.parse(match[0]);
+      const items = (parsed.news||[]).map(n => ({ id:uid(), company:co, ...n, fetchedAt:Date.now() }));
+      setNewsItems(p => [...items, ...p.filter(x=>x.company!==co)]);
+    } catch { alert("뉴스 검색 실패. API 키를 확인해주세요."); }
+    setLoadingCo(null);
+  };
+
+  const fetchAll = async () => { for (const c of watchList) await fetchNews(c); };
+  const badCounts = newsItems.reduce((a,n)=>{ if(n.sentiment==="bad") a[n.company]=(a[n.company]||0)+1; return a; },{});
+  const alerts = Object.entries(badCounts).filter(([,cnt])=>cnt>=5);
+  const shown = filter==="all" ? newsItems : newsItems.filter(n=>n.sentiment===filter);
+
+  return (
+    <div>
+      {alerts.length>0&&(
+        <div className="mb-4 bg-red-50 border border-red-300 rounded-xl p-4">
+          <div className="font-semibold text-red-700 mb-2">🚨 모니터링 알람</div>
+          {alerts.map(([co,cnt])=>(
+            <div key={co} className="text-sm text-red-600 flex items-center gap-2">
+              <span className="w-1.5 h-1.5 bg-red-500 rounded-full flex-shrink-0" />
+              <span><strong>{co}</strong> — Bad 뉴스 {cnt}건 감지. 즉시 확인 필요!</span>
+            </div>
+          ))}
+        </div>
+      )}
+      <div className="bg-white rounded-xl border p-4 mb-4">
+        <div className="text-sm font-semibold text-gray-700 mb-3">📡 모니터링 기업 목록</div>
+        <div className="flex gap-2 mb-3 flex-wrap">
+          <Input value={coInput} onChange={setCoInput} placeholder="기업명 입력 (예: 카카오페이)" cls="flex-1 min-w-40"
+            onKeyDown={e=>e.key==="Enter"&&addCo()} />
+          <Btn onClick={addCo} cls="bg-gray-100 text-gray-700 hover:bg-gray-200">추가</Btn>
+          <Btn onClick={fetchAll} disabled={!!loadingCo||watchList.length===0} cls="bg-indigo-500 text-white hover:bg-indigo-600">
+            {loadingCo?"⏳ 검색중":"🔍 전체 검색"}
+          </Btn>
+        </div>
+        <div className="flex flex-wrap gap-2">
+          {watchList.length===0&&<span className="text-sm text-gray-400">모니터링할 기업을 추가하세요</span>}
+          {watchList.map(c=>(
+            <div key={c} className="flex items-center gap-1.5 bg-gray-100 rounded-full px-3 py-1.5">
+              <span className="text-sm text-gray-800 font-medium">{c}</span>
+              {badCounts[c]>=5&&<span className="text-xs">🚨</span>}
+              {badCounts[c]>0&&<span className={`text-xs font-bold ${badCounts[c]>=5?"text-red-500":"text-orange-400"}`}>Bad {badCounts[c]}</span>}
+              <button onClick={()=>fetchNews(c)} disabled={loadingCo===c} className="text-xs text-indigo-500 hover:text-indigo-700 ml-0.5">{loadingCo===c?"⏳":"↻"}</button>
+              <button onClick={()=>setWatchList(p=>p.filter(x=>x!==c))} className="text-xs text-gray-400 hover:text-red-400">✕</button>
+            </div>
+          ))}
+        </div>
+      </div>
+      <div className="flex gap-2 mb-4">
+        {[["all","전체"],["good","✅ Good"],["bad","❌ Bad"]].map(([v,l])=>(
+          <button key={v} onClick={()=>setFilter(v)} className={`px-4 py-1.5 rounded-full text-sm font-medium transition ${filter===v?"bg-indigo-500 text-white":"bg-white border text-gray-600 hover:bg-gray-50"}`}>{l}</button>
+        ))}
+        <span className="ml-auto text-sm text-gray-400 self-center">{shown.length}건</span>
+      </div>
+      <div className="space-y-2.5">
+        {shown.length===0&&<div className="text-center py-16 text-gray-400 text-sm">기업을 추가하고 뉴스 검색을 실행해보세요</div>}
+        {shown.map(n=>(
+          <div key={n.id} className={`bg-white rounded-xl border p-4 border-l-4 ${n.sentiment==="good"?"border-l-green-400":"border-l-red-400"}`}>
+            <div className="flex items-start gap-3">
+              <div className="flex-1 min-w-0">
+                <div className="flex items-center gap-2 flex-wrap mb-1.5">
+                  <Badge c="bg-gray-100 text-gray-700" label={n.company} />
+                  <Badge c={n.sentiment==="good"?"bg-green-100 text-green-700":"bg-red-100 text-red-700"} label={n.sentiment==="good"?"✅ Good":"❌ Bad"} />
+                  <span className="text-xs text-gray-400">{n.date||new Date(n.fetchedAt).toLocaleDateString("ko-KR")}</span>
+                </div>
+                <div className="font-medium text-gray-800 text-sm leading-snug">{n.title}</div>
+                <div className="text-xs text-gray-500 mt-1 leading-relaxed">{n.summary}</div>
+              </div>
+            </div>
+          </div>
+        ))}
+      </div>
+    </div>
+  );
+}
+
+// ══════════════════════════════════════════════════════
+// ROOT APP
+// ══════════════════════════════════════════════════════
+const MODULES = [
+  { id:"tasks",    icon:"📋", label:"업무 리스트",    Comp:TasksModule,    needsKey:false },
+  { id:"mail",     icon:"📬", label:"수신메일 현황",  Comp:MailModule,     needsKey:true },
+  { id:"reports",  icon:"📄", label:"업무 보고서 DB", Comp:ReportsModule,  needsKey:true },
+  { id:"partners", icon:"🤝", label:"제휴기업 관리",  Comp:PartnersModule, needsKey:false },
+  { id:"projects", icon:"🚀", label:"프로젝트 수행",  Comp:ProjectsModule, needsKey:false },
+  { id:"news",     icon:"📰", label:"뉴스 모니터링",  Comp:NewsModule,     needsKey:true },
+  { id:"settings", icon:"⚙️", label:"설정",           Comp:null,           needsKey:false },
+];
+
+function App() {
+  const [authed, setAuthed] = useState(() => !!LS.get("ws_auth"));
+  const [tab, setTab] = useState("tasks");
+  const [apiKey, setApiKey] = useState(() => LS.get("ws_apikey") || "");
+
+  if (!authed) return <LoginPage onLogin={() => setAuthed(true)} />;
+
+  const active = MODULES.find(m => m.id === tab);
+
+  return (
+    <div className="flex h-screen bg-gray-50 overflow-hidden">
+      {/* Sidebar */}
+      <div className="w-52 bg-white border-r flex-shrink-0 flex flex-col shadow-sm">
+        <div className="px-4 py-5 border-b">
+          <div className="font-bold text-gray-800 text-sm leading-tight">🗂️ 업무 비서 시스템</div>
+          <div className="text-xs text-gray-400 mt-1">{new Date().toLocaleDateString("ko-KR")}</div>
+        </div>
+        <nav className="flex-1 p-3 space-y-0.5 overflow-y-auto">
+          {MODULES.map(m=>(
+            <button key={m.id} onClick={()=>setTab(m.id)}
+              className={`w-full text-left px-3 py-2.5 rounded-xl text-sm font-medium flex items-center gap-2.5 transition
+                ${tab===m.id?"bg-indigo-50 text-indigo-700 font-semibold":"text-gray-600 hover:bg-gray-50"}`}>
+              <span>{m.icon}</span><span>{m.label}</span>
+            </button>
+          ))}
+        </nav>
+        <div className="px-4 py-3 border-t">
+          {apiKey
+            ? <div className="text-xs text-green-600">✅ API 키 연결됨</div>
+            : <div className="text-xs text-red-400">⚠️ API 키 미설정</div>}
+        </div>
+      </div>
+      {/* Content */}
+      <div className="flex-1 overflow-y-auto">
+        <div className="max-w-4xl mx-auto p-6">
+          <div className="mb-5 flex items-center justify-between">
+            <h1 className="text-xl font-bold text-gray-800">{active?.icon} {active?.label}</h1>
+          </div>
+          {tab === "settings"
+            ? <SettingsModule apiKey={apiKey} setApiKey={setApiKey} onLogout={()=>{LS.set("ws_auth",false);setAuthed(false);}} />
+            : active && <active.Comp apiKey={apiKey} />}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+ReactDOM.createRoot(document.getElementById("root")).render(<App />);
+</script>
+</body>
+</html>
